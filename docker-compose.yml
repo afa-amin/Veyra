@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: veyra
+      POSTGRES_USER: veyra
+      POSTGRES_PASSWORD: veyra_dev_password_change_me
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veyra -d veyra"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: veyra
+      MINIO_ROOT_PASSWORD: veyra_dev_password_change_me
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9001:9001"
+
+  api:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    command: cargo run -p veyra-api
+    environment:
+      DATABASE_URL: postgres://veyra:veyra_dev_password_change_me@postgres:5432/veyra
+      VEYRA_BIND: 0.0.0.0:4000
+      VEYRA_PUBLIC_BASE_URL: http://localhost
+      VEYRA_ENV: development
+      VEYRA_DATA_DIR: /workspace/data
+      VEYRA_MASTER_ENCRYPTION_KEY: ZGV2LXZleXJhLW1hc3Rlci1rZXktMzItYnl0ZXMtbG9uZw==
+      STORAGE_DRIVER: local
+      MAX_UPLOAD_BYTES: 5368709120
+      RUST_LOG: info
+    volumes:
+      - ./:/workspace
+      - veyra_data:/workspace/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx.Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  minio_data:
+  veyra_data:
