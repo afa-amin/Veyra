@@ -1,69 +1,47 @@
-//! Error types for SecureDrop.
+//! Error types for the Veyra cryptographic core.
 
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum SecureDropError {
-    #[error("SecureDrop has not been initialized. Run `securedrop setup` first.")]
-    NotInitialized,
-
-    #[error("Master secret or public parameters are missing or corrupted")]
+pub enum VeyraError {
+    #[error("master secret or public parameters are missing or corrupted")]
     MissingMasterMaterial,
 
-    #[error("User `{0}` does not exist")]
-    UserNotFound(String),
-
-    #[error("User `{0}` already exists")]
-    UserAlreadyExists(String),
-
-    #[error("Package not found or unreadable: {0}")]
-    PackageNotFound(String),
-
-    #[error("Invalid policy: {0}")]
+    #[error("invalid policy: {0}")]
     InvalidPolicy(String),
 
-    #[error("Access denied: the user's attributes do not satisfy the policy")]
+    #[error("access denied: the recipient's attributes do not satisfy the policy")]
     AccessDenied,
 
-    #[error("Decryption failed (wrong key, tampered package, or policy mismatch)")]
+    #[error("decryption failed (wrong key, tampered object, or policy mismatch)")]
     DecryptionFailed,
 
-    #[error("Cryptographic operation failed: {0}")]
+    #[error("cryptographic operation failed: {0}")]
     Crypto(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Serialization error: {0}")]
+    #[error("serialization error: {0}")]
     Serialization(String),
 
-    #[error("Attribute `{0}` is not in the allowed universe")]
+    #[error("attribute `{0}` is not allowed")]
     UnknownAttribute(String),
-
-    #[error("Authority `{0}` is not registered with the central authority")]
-    UnknownAuthority(String),
-
-    #[error(
-        "Policy mixes attributes from multiple authorities under OR/threshold at: {0}. \
-         In multi-authority mode, OR/threshold combinators may only combine attributes \
-         from a single authority; authorities themselves are always combined with AND."
-    )]
-    MixedAuthorityPolicy(String),
 
     #[error("{0}")]
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, SecureDropError>;
+pub type Result<T> = std::result::Result<T, VeyraError>;
 
-impl From<bincode::Error> for SecureDropError {
+impl From<bincode::Error> for VeyraError {
     fn from(e: bincode::Error) -> Self {
-        SecureDropError::Serialization(e.to_string())
+        VeyraError::Serialization(e.to_string())
     }
 }
 
-impl From<serde_json::Error> for SecureDropError {
+impl From<serde_json::Error> for VeyraError {
     fn from(e: serde_json::Error) -> Self {
-        SecureDropError::Serialization(e.to_string())
+        VeyraError::Serialization(e.to_string())
     }
 }

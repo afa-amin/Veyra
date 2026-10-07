@@ -1,10 +1,14 @@
+# Quick start (development / evaluation):
+#   cp .env.docker.example .env      # then edit the two secrets
+#   docker compose up --build
+# For production put a TLS terminator in front of the nginx service and set VEYRA_ENV=production with SMTP.
 services:
   postgres:
     image: postgres:17-alpine
     environment:
       POSTGRES_DB: veyra
       POSTGRES_USER: veyra
-      POSTGRES_PASSWORD: veyra_dev_password_change_me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (alphanumeric)}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U veyra -d veyra"]
       interval: 3s
@@ -13,46 +17,59 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: veyra
-      MINIO_ROOT_PASSWORD: veyra_dev_password_change_me
-    volumes:
-      - minio_data:/data
-    ports:
-      - "9001:9001"
-
   api:
-    image: rust:1.88-bookworm
-    working_dir: /workspace
-    command: cargo run -p veyra-api
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
     environment:
-      DATABASE_URL: postgres://veyra:veyra_dev_password_change_me@postgres:5432/veyra
+      DATABASE_URL: postgres://veyra:${POSTGRES_PASSWORD}@postgres:5432/veyra
       VEYRA_BIND: 0.0.0.0:4000
-      VEYRA_PUBLIC_BASE_URL: http://localhost
-      VEYRA_ENV: development
-      VEYRA_DATA_DIR: /workspace/data
-      VEYRA_MASTER_ENCRYPTION_KEY: ZGV2LXZleXJhLW1hc3Rlci1rZXktMzItYnl0ZXMtbG9uZw==
-      STORAGE_DRIVER: local
-      MAX_UPLOAD_BYTES: 5368709120
+      VEYRA_PUBLIC_BASE_URL: ${VEYRA_PUBLIC_BASE_URL:-http://localhost}
+      VEYRA_ENV: ${VEYRA_ENV:-production}
+      VEYRA_TRUST_PROXY: "true"
+      VEYRA_ADMIN_EMAIL: ${VEYRA_ADMIN_EMAIL:-}
+      VEYRA_MASTER_ENCRYPTION_KEY: ${VEYRA_MASTER_ENCRYPTION_KEY:?set VEYRA_MASTER_ENCRYPTION_KEY in .env (openssl rand -base64 48)}
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-5368709120}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_TLS: ${SMTP_TLS:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-Veyra <no-reply@example.com>}
       RUST_LOG: info
     volumes:
-      - ./:/workspace
-      - veyra_data:/workspace/data
+      - veyra_data:/var/lib/veyra
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
 
   nginx:
     build:
       context: .
       dockerfile: docker/nginx.Dockerfile
     ports:
-      - "80:80"
+      - "${VEYRA_HTTP_PORT:-80}:80"
     depends_on:
       - api
+    restart: unless-stopped
+
+  # Optional S3-compatible storage for testing: docker compose --profile s3 up
+  minio:
+    profiles: ["s3"]
+    image: minio/minio:latest
+    command: server /data --console-address "127.0.0.1:9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-veyra}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY to use the s3 profile}
+    volumes:
+      - minio_data:/data
 
 volumes:
   postgres_data:

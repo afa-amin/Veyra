@@ -9,6 +9,7 @@ import { sendPage } from "./pages/send.js";
 import { transferPage } from "./pages/transfer.js";
 import { settingsPage } from "./pages/settings.js";
 import { downloadPage } from "./pages/download.js";
+import { adminPage } from "./pages/admin.js";
 import { legalPage } from "./pages/legal.js";
 import "./styles.css";
 
@@ -92,6 +93,13 @@ async function renderRoute() {
         break;
       case "settings":
         settingsPage(user);
+        break;
+      case "admin":
+        if (user.role !== "admin") {
+          renderErrorPage("You do not have access to this page.");
+        } else {
+          await adminPage(user);
+        }
         break;
       case "security":
       case "privacy":

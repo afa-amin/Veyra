@@ -8,26 +8,20 @@ Veyra is a production-oriented secure file transfer service. It presents a simpl
 
 ## Quick start
 
-Requirements for local development:
-
-- Docker Compose
-- A browser
-
-Run:
+Requirements: Docker Compose and a browser.
 
 ```bash
 git clone <your-repository>
-cd veyra
-docker compose up
+cd Veyra
+cp .env.docker.example .env     # set POSTGRES_PASSWORD and VEYRA_MASTER_ENCRYPTION_KEY
+docker compose up --build
 ```
 
-Open:
+Open `http://localhost`.
 
-```text
-http://localhost
-```
+With the example settings (`VEYRA_ENV=development`) and no SMTP server, the one-time verification code is printed to the API log (`docker compose logs api`). In production (`VEYRA_ENV=production`, the default) SMTP is mandatory and the process refuses to start without it.
 
-The first registered account becomes the development administrator. The development OTP is written to the API structured logs instead of being delivered by email.
+The first registered account becomes the administrator. Set `VEYRA_ADMIN_EMAIL` so that only that address can claim the role. Administrators manage the attributes used by restricted transfers under **Admin** in the web UI.
 
 ## Product flow
 
@@ -36,7 +30,7 @@ Register → Login → Select file → Configure access → Create Secure Link
     → Recipient opens link → OTP verification → Authorized decryption → Download
 ```
 
-Persistent object storage contains only Veyra encrypted objects (`.vobj`). Plaintext upload data exists only transiently on the API host while it is being encrypted.
+Persistent object storage contains only Veyra encrypted objects (`.vobj`). During upload the plaintext exists only in a private (mode 0600) temporary file that is deleted as soon as encryption finishes, including on every error path, and stale files are purged at startup. Downloads are decrypted in a streaming fashion and never written to disk as plaintext.
 
 ## Architecture
 
@@ -70,7 +64,8 @@ veyra/
 ├── core/                 # Rust cryptographic library
 ├── api/                  # Rust HTTP API and migrations
 ├── frontend/             # Vite + Vanilla JavaScript SPA
-├── docker/               # Nginx configuration
+├── docker/               # API and Nginx images, Nginx configuration
+├── installer/            # Bare-metal installer (systemd + Nginx)
 ├── docs/                 # Architecture and security documentation
 ├── docker-compose.yml
 ├── .env.example
@@ -91,7 +86,7 @@ random 256-bit DEK
 
 The streaming object format is versioned and authenticates the package header as AES-GCM additional authenticated data. Each chunk gets a unique derived nonce.
 
-The CP-ABE implementation is adapted from the supplied SecureDrop research implementation. It has **not** been independently audited. Treat the cryptographic core as security-sensitive code requiring professional review before high-value production deployment.
+Attribute exponents of the CP-ABE scheme are derived from a secret key held by the authority (see `docs/CRYPTOGRAPHY.md`). The cryptographic core has **not** been independently audited. Treat the cryptographic core as security-sensitive code requiring professional review before high-value production deployment.
 
 ## Configuration
 
@@ -101,7 +96,7 @@ Production deployments should provide a strong `VEYRA_MASTER_ENCRYPTION_KEY` thr
 
 ## Testing
 
-When Rust tooling is available:
+Commit the generated `Cargo.lock` after the first build. With Rust (1.88 or newer):
 
 ```bash
 cargo test --workspace
@@ -111,7 +106,7 @@ Frontend:
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run build
 ```
 

@@ -22,6 +22,7 @@ export function renderLayout(content, { user = null, title = "Veyra" } = {}) {
               ? `
                 <a href="#/dashboard">Dashboard</a>
                 <a href="#/send">Send</a>
+                ${user.role === "admin" ? '<a href="#/admin">Admin</a>' : ""}
                 <a href="#/settings">Settings</a>
                 <button class="link-button" id="logoutButton">Log out</button>
               `

@@ -80,3 +80,11 @@ input[readonly] { background: #fafbfc; }
   .center-card { margin-top: 20px; padding: 26px 20px; }
   .page-head h1 { font-size: 35px; }
 }
+
+/* Admin attribute editor */
+.admin-list { display: grid; gap: 12px; margin-top: 16px; }
+.admin-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 2fr) auto; gap: 12px; align-items: start; padding: 12px 0; border-top: 1px solid rgba(127, 127, 127, 0.2); }
+.admin-user { display: grid; gap: 2px; word-break: break-word; }
+.admin-row textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; width: 100%; resize: vertical; }
+@media (max-width: 720px) { .admin-row { grid-template-columns: 1fr; } }
+.policy-row input[aria-invalid="true"] { outline: 2px solid #d9534f; }

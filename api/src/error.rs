@@ -1,8 +1,14 @@
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
-use serde::Serialize;
+use axum::{
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde_json::json;
+use thiserror::Error;
 use tracing::error;
+use veyra_core::VeyraError;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum AppError {
     #[error("unauthorized")]
     Unauthorized,
@@ -10,21 +16,70 @@ pub enum AppError {
     Forbidden,
     #[error("not found")]
     NotFound,
+    /// The message is always a curated static string, never user input or internals.
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("conflict")]
     Conflict,
-    #[error("internal error")]
-    Internal(#[source] anyhow::Error),
+    #[error("too many requests")]
+    TooManyRequests,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
 }
-impl From<sqlx::Error> for AppError { fn from(e: sqlx::Error) -> Self { error!(error=%e,"database error"); Self::Internal(e.into()) } }
-impl From<std::io::Error> for AppError { fn from(e: std::io::Error) -> Self { error!(error=%e,"io error"); Self::Internal(e.into()) } }
-impl From<veyra_core::SecureDropError> for AppError { fn from(e: veyra_core::SecureDropError) -> Self { error!(error=%e,"crypto error"); Self::Internal(e.into()) } }
-impl From<anyhow::Error> for AppError { fn from(e: anyhow::Error) -> Self { error!(error=%e,"application error"); Self::Internal(e) } }
-#[derive(Serialize)] struct Body { error: &'static str, message: &'static str }
+
+impl AppError {
+    pub fn bad(msg: &str) -> Self {
+        AppError::BadRequest(msg.to_string())
+    }
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(e: sqlx::Error) -> Self {
+        AppError::Internal(e.into())
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(e: std::io::Error) -> Self {
+        AppError::Internal(e.into())
+    }
+}
+
+impl From<VeyraError> for AppError {
+    fn from(e: VeyraError) -> Self {
+        match e {
+            VeyraError::AccessDenied => AppError::Forbidden,
+            VeyraError::InvalidPolicy(_) | VeyraError::UnknownAttribute(_) => {
+                AppError::bad("Invalid access requirements")
+            }
+            other => AppError::Internal(other.into()),
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, code, msg) = match self { Self::Unauthorized => (StatusCode::UNAUTHORIZED,"unauthorized","Authentication required"), Self::Forbidden => (StatusCode::FORBIDDEN,"forbidden","Access denied"), Self::NotFound => (StatusCode::NOT_FOUND,"not_found","Resource not found"), Self::BadRequest(_) => (StatusCode::BAD_REQUEST,"bad_request","The request could not be processed"), Self::Conflict => (StatusCode::CONFLICT,"conflict","The requested resource already exists"), Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR,"internal_error","We couldn't complete this request") };
-        (status, Json(Body { error: code, message: msg })).into_response()
+        let (status, code, message) = match &self {
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized", "Authentication is required".to_string()),
+            AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "Access denied".to_string()),
+            AppError::NotFound => (StatusCode::NOT_FOUND, "not_found", "Not found".to_string()),
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.clone()),
+            AppError::Conflict => (StatusCode::CONFLICT, "conflict", "The resource already exists".to_string()),
+            AppError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_requests",
+                "Too many attempts. Please wait and try again later.".to_string(),
+            ),
+            AppError::Internal(e) => {
+                error!(error = ?e, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal", "Something went wrong".to_string())
+            }
+        };
+        let mut resp = (status, Json(json!({ "error": code, "message": message }))).into_response();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        }
+        resp
     }
 }

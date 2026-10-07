@@ -1,127 +1,202 @@
+mod auth;
+mod cleanup;
 mod config;
 mod crypto_service;
+mod db;
+mod download;
 mod error;
+mod mail;
+mod ratelimit;
+mod state;
 mod storage;
+mod transfers;
+mod util;
 
-use anyhow::{Context, Result};
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use argon2::password_hash::{rand_core::OsRng as PasswordRng, SaltString};
-use axum::{extract::{Multipart, Path, State}, body::Body, http::{HeaderMap}, response::{IntoResponse, Response}, routing::{get, post}, Json, Router};
-use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{Duration, Utc};
-use rand::{rngs::OsRng, RngCore};
-use serde::{Deserialize, Serialize};
+use anyhow::{bail, Context, Result};
+use axum::{
+    extract::{DefaultBodyLimit, Request},
+    http::HeaderValue,
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
+    Json, Router,
+};
+use config::Config;
+use hkdf::Hkdf;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use std::{collections::HashMap, io::Write, sync::Arc};
-use tokio::sync::RwLock;
-use tokio::{fs, io::AsyncWriteExt};
-use tokio_util::io::ReaderStream;
+use sha2::Sha256;
+use sqlx::postgres::PgPoolOptions;
+use state::AppState;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 use tracing::info;
-use uuid::Uuid;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use lettre::transport::smtp::authentication::Credentials as SmtpCredentials;
-use veyra_core::{decrypt_reader, encrypt_reader, keygen, parse_policy, UserSecretKey, DEFAULT_CHUNK_SIZE};
 
-use crate::{config::Config, error::AppError, storage::ObjectStore};
+const MAX_CONCURRENT_ENCRYPTIONS: usize = 4;
+const MAX_CONCURRENT_DOWNLOADS: usize = 64;
 
-#[derive(Clone)] struct AppState { cfg: Config, db: PgPool, store: Arc<dyn ObjectStore>, dev_otps: Arc<RwLock<HashMap<String,String>>>, master: Arc<veyra_core::MasterSecretKey>, public: Arc<veyra_core::PublicKey> }
-
-#[derive(Serialize)] struct ApiMessage { message: String }
-#[derive(Deserialize)] struct AuthCredentials { email: String, password: String, display_name: Option<String> }
-#[derive(Serialize)] struct UserOut { id: Uuid, email: String, display_name: String, role: String, attributes: Value }
-#[derive(Serialize)] struct SessionOut { user: UserOut }
-#[derive(Serialize)] struct TransferCreatedOut { #[serde(flatten)] transfer: TransferOut, secure_link: String }
-#[derive(Serialize)] struct TransferOut { id: Uuid, original_filename: String, size_bytes: i64, mime_type: String, recipient_email: String, access_mode: String, expires_at: String, download_limit: Option<i32>, download_count: i32, status: String, created_at: String }
-#[derive(Deserialize)] struct VerifyBody { email: String }
-#[derive(Deserialize)] struct VerifyCodeBody { email: String, code: String }
-#[derive(Deserialize)] struct AttributesBody { attributes: Vec<String> }
-
-fn hash_token(token: &str) -> String { let mut h=Sha256::new(); h.update(token.as_bytes()); hex::encode(h.finalize()) }
-fn random_token() -> String { let mut b=[0u8;32]; OsRng.fill_bytes(&mut b); URL_SAFE_NO_PAD.encode(b) }
-fn random_otp() -> String { let mut b=[0u8;4]; OsRng.fill_bytes(&mut b); format!("{:06}", u32::from_be_bytes(b)%1_000_000) }
-fn safe_filename(name:&str)->String { let base=name.replace(['/', '\\', '\0'], "_"); let trimmed=base.trim(); if trimmed.is_empty(){"file".into()} else {trimmed.chars().take(180).collect()} }
-fn safe_mime(s:&str)->String { let s=s.trim(); if s.is_empty(){"application/octet-stream".into()} else {s.chars().take(120).collect()} }
-
-async fn migrate(db:&PgPool)->Result<()> { let sql=include_str!("../migrations/001_init.sql"); for statement in sql.split(';').map(str::trim).filter(|s|!s.is_empty()){ sqlx::query(statement).execute(db).await?; } Ok(()) }
-
-async fn current_user(state:&AppState, jar:&CookieJar, _headers:&HeaderMap)->Result<(Uuid, CookieJar),AppError>{
-    let c=jar.get("veyra_session").ok_or(AppError::Unauthorized)?; let token_hash=hash_token(c.value());
-    let row=sqlx::query("SELECT user_id, csrf_hash, expires_at FROM sessions WHERE token_hash=$1").bind(token_hash).fetch_optional(&state.db).await?.ok_or(AppError::Unauthorized)?;
-    let expires: chrono::DateTime<Utc>=row.try_get("expires_at").map_err(|_|AppError::Unauthorized)?; if expires<Utc::now(){return Err(AppError::Unauthorized)}
-    Ok((row.try_get("user_id").unwrap(), jar.clone()))
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    if !h.contains_key("cache-control") {
+        h.insert("cache-control", HeaderValue::from_static("no-store"));
+    }
+    resp
 }
 
-async fn require_csrf(state:&AppState, jar:&CookieJar, headers:&HeaderMap)->Result<(),AppError>{
-    let c=jar.get("veyra_session").ok_or(AppError::Unauthorized)?; let h=headers.get("x-csrf-token").and_then(|v|v.to_str().ok()).ok_or(AppError::Forbidden)?;
-    let expected:String=sqlx::query_scalar("SELECT csrf_hash FROM sessions WHERE token_hash=$1").bind(hash_token(c.value())).fetch_one(&state.db).await?;
-    if hash_token(h)!=expected { return Err(AppError::Forbidden); } Ok(())
+async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
 }
 
-async fn get_user(state:&AppState,id:Uuid)->Result<UserOut,AppError>{ let r=sqlx::query("SELECT id,email,display_name,role,attributes FROM users WHERE id=$1").bind(id).fetch_one(&state.db).await?; Ok(UserOut{id:r.try_get("id")?,email:r.try_get("email")?,display_name:r.try_get("display_name")?,role:r.try_get("role")?,attributes:r.try_get("attributes")?}) }
-
-async fn register(State(s):State<AppState>, jar:CookieJar, Json(body):Json<AuthCredentials>)->Result<(CookieJar,Json<SessionOut>),AppError>{
-    let email=body.email.trim().to_lowercase(); if !email.contains('@')||body.password.len()<12{return Err(AppError::BadRequest("Invalid registration details".into()))}
-    let salt=SaltString::generate(&mut PasswordRng); let hash=Argon2::default().hash_password(body.password.as_bytes(),&salt).map_err(|_|AppError::Internal(anyhow::anyhow!("password hashing failed")))?.to_string();
-    let display=body.display_name.filter(|x|!x.trim().is_empty()).unwrap_or_else(||email.split('@').next().unwrap_or("User").to_string());
-    let exists:Option<(Uuid,)>=sqlx::query_as("SELECT id FROM users WHERE email=$1").bind(&email).fetch_optional(&s.db).await?; if exists.is_some(){return Err(AppError::Conflict)}
-    let count:i64=sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(&s.db).await?; let role=if count==0{"admin"}else{"user"};
-    let id:Uuid=sqlx::query_scalar("INSERT INTO users(id,email,password_hash,display_name,role,attributes) VALUES($1,$2,$3,$4,$5,$6) RETURNING id").bind(Uuid::new_v4()).bind(&email).bind(hash).bind(display).bind(role).bind(json!(["clearance>=1","department=general","role=member"])).fetch_one(&s.db).await?;
-    let (jar,user)=create_session(&s,jar,id).await?; audit(&s,Some(id),None,"user.registered",json!({})).await?; Ok((jar,Json(SessionOut{user})))
+async fn ready(axum::extract::State(s): axum::extract::State<AppState>) -> Result<Json<Value>, error::AppError> {
+    sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&s.db).await?;
+    Ok(Json(json!({ "status": "ready" })))
 }
 
-async fn create_session(s:&AppState, jar:CookieJar,user:Uuid)->Result<(CookieJar,UserOut),AppError>{
-    let raw=random_token(); let csrf=random_token(); let exp=Utc::now()+Duration::hours(s.cfg.session_ttl_hours); sqlx::query("INSERT INTO sessions(id,token_hash,user_id,csrf_hash,expires_at) VALUES($1,$2,$3,$4,$5)").bind(Uuid::new_v4()).bind(hash_token(&raw)).bind(user).bind(hash_token(&csrf)).bind(exp).execute(&s.db).await?;
-    let session=Cookie::build(("veyra_session",raw)).path("/").http_only(true).secure(s.cfg.environment=="production").same_site(SameSite::Strict).build(); let csrf_cookie=Cookie::build(("veyra_csrf",csrf)).path("/").http_only(false).secure(s.cfg.environment=="production").same_site(SameSite::Strict).build(); Ok((jar.add(session).add(csrf_cookie),get_user(s,user).await?))
+fn derive_server_key(secret: &str) -> Result<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(b"veyra-server-key-salt-v1"), secret.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(b"veyra-hmac-key-v1", &mut key)
+        .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+    Ok(key)
 }
 
-async fn login(State(s):State<AppState>, jar:CookieJar, Json(body):Json<AuthCredentials>)->Result<(CookieJar,Json<SessionOut>),AppError>{
-    let email=body.email.trim().to_lowercase(); let r=sqlx::query("SELECT id,password_hash FROM users WHERE email=$1").bind(&email).fetch_optional(&s.db).await?.ok_or(AppError::Unauthorized)?; let id:Uuid=r.try_get("id")?; let ph:String=r.try_get("password_hash")?;
-    PasswordHash::new(&ph).ok().and_then(|p|Argon2::default().verify_password(body.password.as_bytes(),&p).ok()).ok_or(AppError::Unauthorized)?; let (jar,user)=create_session(&s,jar,id).await?; audit(&s,Some(id),None,"user.login",json!({})).await?; Ok((jar,Json(SessionOut{user})))
+#[cfg(unix)]
+fn restrict_dir(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
 }
 
-async fn logout(State(s):State<AppState>, jar:CookieJar, headers:HeaderMap)->Result<(CookieJar,Json<ApiMessage>),AppError>{ let (_id,_)=current_user(&s,&jar,&headers).await?; require_csrf(&s,&jar,&headers).await?; if let Some(c)=jar.get("veyra_session"){sqlx::query("DELETE FROM sessions WHERE token_hash=$1").bind(hash_token(c.value())).execute(&s.db).await?;} Ok((jar.remove(Cookie::from("veyra_session")).remove(Cookie::from("veyra_csrf")),Json(ApiMessage{message:"Logged out".into()}))) }
+#[cfg(not(unix))]
+fn restrict_dir(_path: &std::path::Path) {}
 
-async fn me(State(s):State<AppState>, jar:CookieJar, headers:HeaderMap)->Result<Json<UserOut>,AppError>{let(id,_)=current_user(&s,&jar,&headers).await?;Ok(Json(get_user(&s,id).await?))}
-
-async fn list_transfers(State(s):State<AppState>, jar:CookieJar, headers:HeaderMap)->Result<Json<Vec<TransferOut>>,AppError>{let(uid,_)=current_user(&s,&jar,&headers).await?;let rows=sqlx::query("SELECT t.id,f.original_filename,f.size_bytes,f.mime_type,t.recipient_email,t.access_mode,t.expires_at,t.download_limit,t.download_count,t.status,t.created_at FROM transfers t JOIN files f ON f.id=t.file_id WHERE t.sender_id=$1 ORDER BY t.created_at DESC LIMIT 100").bind(uid).fetch_all(&s.db).await?;let mut out=Vec::new();for r in rows{out.push(TransferOut{id:r.try_get("id")?,original_filename:r.try_get("original_filename")?,size_bytes:r.try_get("size_bytes")?,mime_type:r.try_get("mime_type")?,recipient_email:r.try_get("recipient_email")?,access_mode:r.try_get("access_mode")?,expires_at:r.try_get::<chrono::DateTime<Utc>,_>("expires_at")?.to_rfc3339(),download_limit:r.try_get("download_limit")?,download_count:r.try_get("download_count")?,status:r.try_get("status")?,created_at:r.try_get::<chrono::DateTime<Utc>,_>("created_at")?.to_rfc3339()})}Ok(Json(out))}
-
-async fn send_transfer(State(s):State<AppState>, jar:CookieJar, headers:HeaderMap, mut mp:Multipart)->Result<Json<TransferCreatedOut>,AppError>{
-    let (uid,_)=current_user(&s,&jar,&headers).await?; require_csrf(&s,&jar,&headers).await?; let mut recipient=None;let mut access_mode="simple".to_string();let mut expires_hours=72i64;let mut download_limit=Some(1i32);let mut destroy=false;let mut policy_requirements:Vec<String>=Vec::new();let mut policy_expr="true".to_string();let mut temp_plain=None;let mut filename="file".to_string();let mut mime="application/octet-stream".to_string();let mut size=0u64;
-    while let Some(mut field)=mp.next_field().await.map_err(|_|AppError::BadRequest("Invalid multipart upload".into()))? { let name=field.name().unwrap_or("").to_string(); if name=="file" {filename=safe_filename(field.file_name().unwrap_or("file"));mime=safe_mime(field.content_type().map(|x|x.as_ref()).unwrap_or("application/octet-stream"));let p=s.cfg.data_dir.join("tmp").join(format!("{}.plain",Uuid::new_v4()));if let Some(parent)=p.parent(){fs::create_dir_all(parent).await?;}let mut f=fs::File::create(&p).await?;while let Some(chunk)=field.chunk().await.map_err(|_|AppError::BadRequest("Upload failed".into()))?{size+=chunk.len() as u64;if size>s.cfg.max_upload_bytes{drop(f);let _=fs::remove_file(&p).await;return Err(AppError::BadRequest("File is too large".into()));}f.write_all(&chunk).await?;}f.flush().await?;temp_plain=Some(p);}else{let v=field.text().await.map_err(|_|AppError::BadRequest("Invalid form field".into()))?;match name.as_str(){"recipient_email"=>recipient=Some(v.trim().to_lowercase()),"access_mode"=>access_mode=v,"expires_hours"=>expires_hours=v.parse().unwrap_or(72),"download_limit"=>download_limit=if v=="unlimited"{None}else{Some(v.parse().unwrap_or(1))},"destroy_after_first"=>destroy=v=="true","policy_requirements"=>policy_requirements=serde_json::from_str(&v).unwrap_or_default(),"policy_expression"=>policy_expr=v,_=>{}}}}
-    let recipient=recipient.ok_or_else(||AppError::BadRequest("Recipient is required".into()))?; if !(1..=720).contains(&expires_hours){return Err(AppError::BadRequest("Invalid expiration".into()));} if let Some(l)=download_limit{if !(1..=1000).contains(&l){return Err(AppError::BadRequest("Invalid download limit".into()));}}
-    let attrs=policy_requirements.clone();if access_mode=="restricted"{parse_policy(&policy_expr).map_err(|_|AppError::BadRequest("Invalid access requirements".into()))?;let exists:Option<Uuid>=sqlx::query_scalar("SELECT id FROM users WHERE lower(email)=lower($1)").bind(&recipient).fetch_optional(&s.db).await?;if exists.is_none(){return Err(AppError::BadRequest("Restricted transfers require a registered recipient account".into()));}}else{policy_expr="clearance>=1".into();}
-    let plain=temp_plain.ok_or_else(||AppError::BadRequest("File is required".into()))?; let transfer_id=Uuid::new_v4();let object_key=format!("{}/{}.vobj",uid,transfer_id);let enc=s.cfg.data_dir.join("tmp").join(format!("{}.vobj",transfer_id));let input=std::fs::File::open(&plain)?;let mut rng=OsRng;encrypt_reader(&s.public,&policy_expr,&filename,&mime,size,input,std::fs::File::create(&enc)?,DEFAULT_CHUNK_SIZE,&mut rng)?;fs::remove_file(&plain).await?;s.store.put_file(&object_key,&enc).await?;
-    let token=random_token();let exp=Utc::now()+Duration::hours(expires_hours);let file_id=Uuid::new_v4();let mut tx=s.db.begin().await?;sqlx::query("INSERT INTO files(id,original_filename,size_bytes,mime_type,object_key,sender_id) VALUES($1,$2,$3,$4,$5,$6)").bind(file_id).bind(&filename).bind(size as i64).bind(&mime).bind(&object_key).bind(uid).execute(&mut *tx).await?;sqlx::query("INSERT INTO transfers(id,file_id,sender_id,recipient_email,access_mode,access_policy,token_hash,expires_at,download_limit,destroy_after_first) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)").bind(transfer_id).bind(file_id).bind(uid).bind(&recipient).bind(&access_mode).bind(json!({"requirements":attrs,"expression":policy_expr})).bind(hash_token(&token)).bind(exp).bind(download_limit).bind(destroy).execute(&mut *tx).await?;sqlx::query("INSERT INTO recipients(id,transfer_id,email) VALUES($1,$2,$3)").bind(Uuid::new_v4()).bind(transfer_id).bind(&recipient).execute(&mut *tx).await?;sqlx::query("INSERT INTO access_policies(id,transfer_id,expression,requirements) VALUES($1,$2,$3,$4)").bind(Uuid::new_v4()).bind(transfer_id).bind(&policy_expr).bind(json!(attrs)).execute(&mut *tx).await?;tx.commit().await?;audit(&s,Some(uid),Some(transfer_id),"transfer.created",json!({"size_bytes":size,"access_mode":access_mode})).await?;
-    send_verification_email(&s,&recipient,&token,transfer_id).await?;let secure_link=format!("{}/#/download/{}",s.cfg.public_base_url.trim_end_matches('/'),token);let transfer=TransferOut{id:transfer_id,original_filename:filename,size_bytes:size as i64,mime_type:mime,recipient_email:recipient,access_mode,expires_at:exp.to_rfc3339(),download_limit,download_count:0,status:"active".into(),created_at:Utc::now().to_rfc3339()};Ok(Json(TransferCreatedOut{transfer,secure_link}))
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("shutdown signal received");
 }
-
-async fn send_verification_email(s:&AppState,email:&str,_link_token:&str,transfer_id:Uuid)->Result<(),AppError>{let code=random_otp();let exp=Utc::now()+Duration::minutes(s.cfg.otp_ttl_minutes);sqlx::query("INSERT INTO otp_challenges(id,transfer_id,code_hash,expires_at) VALUES($1,$2,$3,$4)").bind(Uuid::new_v4()).bind(transfer_id).bind(hash_token(&code)).bind(exp).execute(&s.db).await?;if let Some(host)=&s.cfg.smtp_host{let from=s.cfg.smtp_from.parse().map_err(|_|AppError::BadRequest("Invalid SMTP_FROM".into()))?;let to=email.parse().map_err(|_|AppError::BadRequest("Invalid recipient email".into()))?;let msg=Message::builder().from(from).to(to).subject("Your Veyra verification code").body(format!("Your Veyra verification code is {}. It expires in {} minutes.",code,s.cfg.otp_ttl_minutes)).map_err(|e|AppError::Internal(e.into()))?;let transport=if let (Some(user),Some(pass))=(s.cfg.smtp_user.clone(),s.cfg.smtp_password.clone()){AsyncSmtpTransport::<Tokio1Executor>::relay(host).map_err(|e|AppError::Internal(e.into()))?.port(s.cfg.smtp_port).credentials(SmtpCredentials::new(user,pass)).build()}else{AsyncSmtpTransport::<Tokio1Executor>::relay(host).map_err(|e|AppError::Internal(e.into()))?.port(s.cfg.smtp_port).build()};transport.send(msg).await.map_err(|e|AppError::Internal(e.into()))?;}else{if s.cfg.environment=="development"{s.dev_otps.write().await.insert(format!("{}:{}",email.to_lowercase(),transfer_id),code.clone());}info!(recipient=%email,transfer_id=%transfer_id,"development OTP generated; configure SMTP for real delivery");}Ok(())}
-
-async fn public_transfer(State(s):State<AppState>,Path(token):Path<String>)->Result<Json<Value>,AppError>{let h=hash_token(&token);let r=sqlx::query("SELECT t.id,f.original_filename,f.size_bytes,t.recipient_email,t.expires_at,t.status FROM transfers t JOIN files f ON f.id=t.file_id WHERE t.token_hash=$1").bind(h).fetch_optional(&s.db).await?.ok_or(AppError::NotFound)?;let exp:chrono::DateTime<Utc>=r.try_get("expires_at")?;if exp<Utc::now()||r.try_get::<String,_>("status")?!="active"{return Err(AppError::NotFound)}Ok(Json(json!({"id":r.try_get::<Uuid,_>("id")?,"filename":r.try_get::<String,_>("original_filename")?,"size_bytes":r.try_get::<i64,_>("size_bytes")?,"recipient_email":r.try_get::<String,_>("recipient_email")?,"expires_at":exp.to_rfc3339()})))}
-
-async fn request_download_otp(State(s):State<AppState>,Path(token):Path<String>,Json(body):Json<VerifyBody>)->Result<Json<ApiMessage>,AppError>{let h=hash_token(&token);let id:Uuid=sqlx::query_scalar("SELECT id FROM transfers WHERE token_hash=$1 AND status='active' AND expires_at>now() AND lower(recipient_email)=lower($2)").bind(h).bind(body.email.trim()).fetch_optional(&s.db).await?.ok_or(AppError::Forbidden)?;send_verification_email(&s,&body.email,&token,id).await?;Ok(Json(ApiMessage{message:"Verification code sent".into()}))}
-
-async fn verify_download(State(s):State<AppState>,Path(token):Path<String>,Json(body):Json<VerifyCodeBody>)->Result<Json<Value>,AppError>{let h=hash_token(&token);let tr=sqlx::query("SELECT id,recipient_email FROM transfers WHERE token_hash=$1 AND status='active' AND expires_at>now() AND lower(recipient_email)=lower($2)").bind(&h).bind(body.email.trim()).fetch_optional(&s.db).await?.ok_or(AppError::Forbidden)?;let tid:Uuid=tr.try_get("id")?;let mut tx=s.db.begin().await?;let r=sqlx::query("SELECT id,code_hash,expires_at,attempts,consumed FROM otp_challenges WHERE transfer_id=$1 ORDER BY created_at DESC LIMIT 1 FOR UPDATE").bind(tid).fetch_optional(&mut *tx).await?.ok_or(AppError::Forbidden)?;let attempts:i32=r.try_get("attempts")?;let exp:chrono::DateTime<Utc>=r.try_get("expires_at")?;if r.try_get::<bool,_>("consumed")?||exp<Utc::now()||attempts>=5{return Err(AppError::Forbidden)}let id:Uuid=r.try_get("id")?;if hash_token(&body.code)!=r.try_get::<String,_>("code_hash")?{sqlx::query("UPDATE otp_challenges SET attempts=attempts+1 WHERE id=$1").bind(id).execute(&mut *tx).await?;tx.commit().await?;return Err(AppError::Forbidden)}sqlx::query("UPDATE otp_challenges SET consumed=true WHERE id=$1").bind(id).execute(&mut *tx).await?;let access=random_token();let access_exp=Utc::now()+Duration::minutes(30);sqlx::query("INSERT INTO download_sessions(id,transfer_id,token_hash,expires_at) VALUES($1,$2,$3,$4)").bind(Uuid::new_v4()).bind(tid).bind(hash_token(&access)).bind(access_exp).execute(&mut *tx).await?;sqlx::query("UPDATE transfers SET verified_at=now() WHERE id=$1").bind(tid).execute(&mut *tx).await?;tx.commit().await?;audit(&s,None,Some(tid),"recipient.verified",json!({})).await?;Ok(Json(json!({"access_token":access,"expires_at":access_exp.to_rfc3339()})))}
-
-async fn download_file(State(s):State<AppState>,Path(token):Path<String>,headers:HeaderMap)->Result<Response,AppError>{let access=headers.get("authorization").and_then(|v|v.to_str().ok()).and_then(|v|v.strip_prefix("Bearer ")).ok_or(AppError::Unauthorized)?;let ds=sqlx::query("SELECT transfer_id,expires_at FROM download_sessions WHERE token_hash=$1").bind(hash_token(access)).fetch_optional(&s.db).await?.ok_or(AppError::Unauthorized)?;let tid:Uuid=ds.try_get("transfer_id")?;let exp:chrono::DateTime<Utc>=ds.try_get("expires_at")?;let link_tid:Uuid=sqlx::query_scalar("SELECT id FROM transfers WHERE token_hash=$1").bind(hash_token(&token)).fetch_optional(&s.db).await?.ok_or(AppError::NotFound)?;if link_tid!=tid{return Err(AppError::Forbidden);}if exp<Utc::now(){return Err(AppError::Unauthorized)}let mut tx=s.db.begin().await?;let tr=sqlx::query("SELECT t.file_id,t.download_limit,t.download_count,t.destroy_after_first,t.status,t.expires_at,f.object_key FROM transfers t JOIN files f ON f.id=t.file_id WHERE t.id=$1 FOR UPDATE").bind(tid).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;let status:String=tr.try_get("status")?;let expires:chrono::DateTime<Utc>=tr.try_get("expires_at")?;let limit:Option<i32>=tr.try_get("download_limit")?;let count:i32=tr.try_get("download_count")?;if status!="active"||expires<Utc::now()||limit.map(|l|count>=l).unwrap_or(false){tx.rollback().await?;return Err(AppError::Forbidden)}sqlx::query("UPDATE transfers SET download_count=download_count+1 WHERE id=$1").bind(tid).execute(&mut *tx).await?;tx.commit().await?;
-    let object_key:String=tr.try_get("object_key")?;let encrypted=s.cfg.data_dir.join("tmp").join(format!("download-{}.vobj",Uuid::new_v4()));let plain=s.cfg.data_dir.join("tmp").join(format!("download-{}.plain",Uuid::new_v4()));s.store.get_file(&object_key,&encrypted).await?;let sk=recipient_key(&s,tid).await?;let mut input=std::fs::File::open(&encrypted)?;let mut output=std::fs::File::create(&plain)?;let header=decrypt_reader(&s.public,&sk,&mut input,&mut output);let _=fs::remove_file(&encrypted).await;header?;output.flush()?;audit(&s,None,Some(tid),"file.downloaded",json!({})).await?;
-    let destroy:bool=tr.try_get("destroy_after_first")?;if destroy{s.store.delete(&object_key).await?;sqlx::query("UPDATE transfers SET status='downloaded' WHERE id=$1").bind(tid).execute(&s.db).await?;}let file=tokio::fs::File::open(&plain).await?;let _=fs::remove_file(&plain).await;let stream=ReaderStream::new(file);Ok(([("content-type","application/octet-stream")],Body::from_stream(stream)).into_response())}
-
-async fn recipient_key(s:&AppState,transfer_id:Uuid)->Result<UserSecretKey,AppError>{let r=sqlx::query("SELECT recipient_email,access_mode FROM transfers WHERE id=$1").bind(transfer_id).fetch_one(&s.db).await?;let email:String=r.try_get("recipient_email")?;let mode:String=r.try_get("access_mode")?;let (uid,attrs) = if mode=="simple" { (Uuid::nil(),vec!["clearance>=1".to_string(),"department=general".to_string(),"role=member".to_string()]) } else { let r=sqlx::query("SELECT id,attributes FROM users WHERE lower(email)=lower($1)").bind(email).fetch_optional(&s.db).await?.ok_or(AppError::Forbidden)?;let uid:Uuid=r.try_get("id")?;let attrs:Vec<String>=r.try_get::<Value,_>("attributes")?.as_array().cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_str().map(ToOwned::to_owned)).collect();(uid,attrs)};let sk=keygen(&s.public,&s.master,&uid.to_string(),&attrs,&mut OsRng)?;Ok(sk)}
-
-async fn revoke(State(s):State<AppState>,Path(id):Path<Uuid>,jar:CookieJar,headers:HeaderMap)->Result<Json<ApiMessage>,AppError>{let(uid,_)=current_user(&s,&jar,&headers).await?;require_csrf(&s,&jar,&headers).await?;let r=sqlx::query("UPDATE transfers SET status='revoked' WHERE id=$1 AND sender_id=$2 RETURNING file_id").bind(id).bind(uid).fetch_optional(&s.db).await?.ok_or(AppError::NotFound)?;audit(&s,Some(uid),Some(id),"transfer.revoked",json!({})).await?;let _=r;Ok(Json(ApiMessage{message:"Access revoked".into()}))}
-
-async fn admin_attributes(State(s):State<AppState>,Path(id):Path<Uuid>,jar:CookieJar,headers:HeaderMap,Json(body):Json<AttributesBody>)->Result<Json<UserOut>,AppError>{let(uid,_)=current_user(&s,&jar,&headers).await?;let role:String=sqlx::query_scalar("SELECT role FROM users WHERE id=$1").bind(uid).fetch_one(&s.db).await?;if role!="admin"{return Err(AppError::Forbidden)}let attrs:Vec<String>=body.attributes.into_iter().filter(|a|a.len()<=160).collect();sqlx::query("UPDATE users SET attributes=$1 WHERE id=$2").bind(json!(attrs)).bind(id).execute(&s.db).await?;Ok(Json(get_user(&s,id).await?))}
-
-async fn audit(s:&AppState,user:Option<Uuid>,transfer:Option<Uuid>,event:&str,metadata:Value)->Result<(),AppError>{sqlx::query("INSERT INTO audit_events(id,user_id,transfer_id,event,metadata) VALUES($1,$2,$3,$4,$5)").bind(Uuid::new_v4()).bind(user).bind(transfer).bind(event).bind(metadata).execute(&s.db).await?;Ok(())}
-
-async fn dev_mailbox(State(s):State<AppState>,Path(email):Path<String>)->Result<Json<Value>,AppError>{if s.cfg.environment!="development"{return Err(AppError::NotFound)}let prefix=email.to_lowercase();let map=s.dev_otps.read().await;let item=map.iter().find(|(k,_)|k.starts_with(&(prefix.clone()+":"))).map(|(_,v)|v.clone()).ok_or(AppError::NotFound)?;Ok(Json(json!({"verification_code":item}))) }
-
-async fn health(State(s):State<AppState>)->Result<Json<Value>,AppError>{sqlx::query_scalar::<_,i32>("SELECT 1").fetch_one(&s.db).await.map_err(AppError::from)?;Ok(Json(json!({"status":"ok","database":"ok","storage":s.cfg.storage_driver,"crypto":"ok"})))}
-async fn ready(State(s):State<AppState>)->Result<Json<Value>,AppError>{health(State(s)).await}
 
 #[tokio::main]
-async fn main()->Result<()>{tracing_subscriber::fmt().json().with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_|"info".into())).init();let cfg=Config::from_env()?;fs::create_dir_all(&cfg.data_dir).await?;let db=PgPoolOptions::new().max_connections(10).connect(&cfg.database_url).await.context("database connection failed")?;migrate(&db).await.context("database migration failed")?;let store=storage::build_store(&cfg).await?;let (public,master)=crypto_service::load_or_create(&cfg.data_dir,&cfg.master_key)?;let state=AppState{cfg:cfg.clone(),db,store,dev_otps:Arc::new(RwLock::new(HashMap::new())),master:Arc::new(master),public:Arc::new(public)};let app=Router::new().route("/health",get(health)).route("/ready",get(ready)).route("/api/v1/auth/register",post(register)).route("/api/v1/auth/login",post(login)).route("/api/v1/auth/logout",post(logout)).route("/api/v1/me",get(me)).route("/api/v1/transfers",get(list_transfers).post(send_transfer)).route("/api/v1/transfers/:id/revoke",post(revoke)).route("/api/v1/admin/users/:id/attributes",post(admin_attributes)).route("/api/v1/download/:token",get(public_transfer)).route("/api/v1/download/:token/request-verification",post(request_download_otp)).route("/api/v1/download/:token/verify",post(verify_download)).route("/api/v1/download/:token/file",get(download_file)).route("/api/v1/dev/mailbox/:email",get(dev_mailbox)).with_state(state.clone());let listener=tokio::net::TcpListener::bind(&cfg.bind).await?;info!(bind=%cfg.bind,"Veyra API started");axum::serve(listener,app).await?;Ok(())}
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .init();
+
+    let cfg = Config::from_env()?;
+    if cfg.is_development() {
+        tracing::warn!("running in DEVELOPMENT mode: verification codes are printed to the log when SMTP is not configured");
+    }
+    if !cfg.cookie_secure() {
+        tracing::warn!("VEYRA_PUBLIC_BASE_URL is not https: session cookies will not be marked Secure");
+    }
+
+    tokio::fs::create_dir_all(&cfg.data_dir).await?;
+    restrict_dir(&cfg.data_dir);
+    let tmp_dir = cfg.data_dir.join("tmp");
+    tokio::fs::create_dir_all(&tmp_dir).await?;
+    restrict_dir(&tmp_dir);
+    // No request can own these files at startup: remove leftovers of a previous crash.
+    cleanup::purge_tmp(&tmp_dir, None).await;
+
+    let db = PgPoolOptions::new()
+        .max_connections(20)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&cfg.database_url)
+        .await
+        .context("database connection failed")?;
+    db::migrate(&db).await.context("database migration failed")?;
+
+    let store = storage::build_store(&cfg).await?;
+
+    // Never silently replace the master key when encrypted data exists.
+    let master_exists = crypto_service::master_file_path(&cfg.data_dir).exists();
+    let files_exist: i64 = sqlx::query_scalar("SELECT count(*) FROM files WHERE status = 'active'")
+        .fetch_one(&db)
+        .await?;
+    if !master_exists && files_exist > 0 && !cfg.allow_new_master {
+        if crypto_service::legacy_master_exists(&cfg.data_dir) {
+            bail!(
+                "this data directory was created by Veyra 0.1, whose objects use a CP-ABE construction that was \
+                 found to be insecure and are not readable by this version. Remove or re-send existing transfers, \
+                 then start with VEYRA_ALLOW_NEW_MASTER=true to create a new master key"
+            );
+        }
+        bail!("master key file is missing but encrypted transfers exist; restore it from backup");
+    }
+    let (public, master) = crypto_service::load_or_create(
+        &cfg.data_dir,
+        &cfg.master_key,
+        !master_exists && (files_exist == 0 || cfg.allow_new_master),
+    )?;
+
+    let server_key = derive_server_key(&cfg.master_key)?;
+    let bind = cfg.bind.clone();
+    let max_body = usize::try_from(cfg.max_upload_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1024 * 1024);
+
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        db,
+        store,
+        master: Arc::new(master),
+        public: Arc::new(public),
+        limiter: Arc::new(ratelimit::RateLimiter::new()),
+        server_key: Arc::new(server_key),
+        crypto_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ENCRYPTIONS)),
+        download_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
+        dummy_hash: Arc::new(auth::make_dummy_hash()?),
+    };
+
+    cleanup::spawn(state.clone());
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/api/v1/auth/register", post(auth::register))
+        .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/me", get(auth::me))
+        .route(
+            "/api/v1/transfers",
+            get(transfers::list_transfers)
+                // Only the upload route accepts large bodies; everything else keeps axum's 2 MiB default.
+                .merge(post(transfers::send_transfer).layer(DefaultBodyLimit::max(max_body))),
+        )
+        .route("/api/v1/transfers/:id/revoke", post(transfers::revoke))
+        .route("/api/v1/admin/users", get(auth::admin_list_users))
+        .route("/api/v1/admin/users/:id/attributes", post(auth::admin_attributes))
+        .route("/api/v1/download/:token", get(download::public_transfer))
+        .route("/api/v1/download/:token/request-verification", post(download::request_download_otp))
+        .route("/api/v1/download/:token/verify", post(download::verify_download))
+        .route("/api/v1/download/:token/status", get(download::download_status))
+        .route("/api/v1/download/:token/file", get(download::download_file))
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("cannot bind {bind}"))?;
+    info!(bind = %bind, "Veyra API started");
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}

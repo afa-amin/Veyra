@@ -21,6 +21,8 @@ export function settingsPage(user) {
           <dd>${escapeHtml(user.email)}</dd>
           <dt>Account role</dt>
           <dd>${escapeHtml(user.role)}</dd>
+          <dt>Access attributes</dt>
+          <dd>${(Array.isArray(user.attributes) ? user.attributes : []).map((a) => `<code>${escapeHtml(a)}</code>`).join(" ") || "None"}</dd>
         </dl>
       </section>
 

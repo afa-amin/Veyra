@@ -1,12 +1,14 @@
 [package]
 name = "veyra-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Veyra cryptographic core"
 license = "MIT"
 
 [dependencies]
-bls12_381 = { version = "0.8.0", features = ["experimental"] }
+# The pairing crate is pinned exactly: the Gt-to-bytes key derivation in
+# `scheme.rs` depends on the crate's canonical element encoding.
+bls12_381 = { version = "=0.8.0", features = ["experimental"] }
 group = "0.13"
 ff = "0.13"
 aes-gcm = "0.10.3"

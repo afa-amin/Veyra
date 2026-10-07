@@ -2,21 +2,25 @@
 
 ## Docker Compose
 
-Development:
+```bash
+cp .env.docker.example .env      # set POSTGRES_PASSWORD and VEYRA_MASTER_ENCRYPTION_KEY
+docker compose up --build
+```
+
+The compose file builds a release image that runs as an unprivileged user and only exposes nginx. It is suitable for evaluation. For production put a TLS terminator in front of nginx, set `VEYRA_ENV=production`, `VEYRA_PUBLIC_BASE_URL=https://...`, SMTP settings and `VEYRA_ADMIN_EMAIL`.
+
+## Bare metal (Ubuntu/Debian)
 
 ```bash
-docker compose up
+sudo ./installer/install.sh --domain veyra.example.com --admin-email you@example.com \
+     --tls-cert /etc/ssl/veyra/fullchain.pem --tls-key /etc/ssl/veyra/privkey.pem
 ```
 
-## Linux production
+The installer builds the project, creates a sandboxed systemd unit (no capabilities, private /tmp and devices, read-only filesystem except the data directory) and an Nginx site with security headers, HSTS (with TLS), per-endpoint rate limits and access-log redaction of link tokens. Production mode requires SMTP.
 
-Recommended layout:
+## Operations
 
-```text
-nginx → Veyra API systemd service → PostgreSQL
-                             └────→ S3/MinIO
-```
-
-Run the API as a dedicated unprivileged service account. Keep its data directory inaccessible to other users. Terminate TLS at Nginx and enable HSTS after confirming the domain is HTTPS-only.
-
-The current repository's Compose setup is intentionally a development environment. Production secrets, TLS certificates, SMTP credentials, PostgreSQL credentials, and the master encryption key must be replaced before deployment.
+- Back up PostgreSQL, `master.v2.enc` and the master secret together. Losing the master key makes every stored transfer unreadable.
+- The API refuses to start if `master.v2.enc` is missing while encrypted transfers exist.
+- Rate limits are per API instance. Multi-instance setups should rate limit at the proxy as well.
+- Upgrading from 0.1: objects created by 0.1 used an insecure CP-ABE attribute mapping and cannot be read by 0.2. See `RELEASE_NOTES.md`.

@@ -18,3 +18,7 @@ data/
 *.log
 .DS_Store
 Thumbs.db
+.git
+docs
+*.md
+!README.md

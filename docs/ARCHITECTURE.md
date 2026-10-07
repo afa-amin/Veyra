@@ -6,7 +6,7 @@ Veyra is a modular monolith. Authentication, transfers, authorization, audit, cr
 
 - `frontend`: Vite + Vanilla JavaScript SPA.
 - `api`: Rust/Axum REST API.
-- `core`: Rust cryptographic library adapted from SecureDrop.
+- `core`: Rust cryptographic library (hybrid AES-256-GCM + CP-ABE key protection).
 - PostgreSQL: identity, transfer metadata, policies, sessions, OTP challenges, and audit events.
 - ObjectStore: local filesystem or S3-compatible storage.
 - Nginx: static frontend delivery and API reverse proxy.

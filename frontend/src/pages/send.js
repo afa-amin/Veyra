@@ -132,15 +132,18 @@ export function sendPage(user) {
     form.set("file", selectedFile);
     form.set("destroy_after_first", String(form.has("destroy_after_first")));
 
+    const error = document.querySelector("#sendError");
     if (form.get("access_mode") === "restricted") {
-      form.set("policy_requirements", JSON.stringify(policyBuilder?.getRequirements() || []));
-      form.set("policy_expression", policyBuilder?.getExpression() || "true");
+      const problem = policyBuilder?.validate();
+      if (problem) {
+        error.textContent = problem;
+        return;
+      }
+      form.set("policy_expression", policyBuilder.getExpression());
     } else {
-      form.set("policy_requirements", "[]");
-      form.set("policy_expression", "true");
+      form.delete("policy_expression");
     }
 
-    const error = document.querySelector("#sendError");
     const progress = document.querySelector("#uploadProgress");
     const progressBar = document.querySelector("#progressBar");
     const progressValue = document.querySelector("#progressValue");

@@ -19,7 +19,7 @@
 
 ## Important limitations
 
-The current CP-ABE implementation is an adapted research implementation and has not received an independent cryptographic audit. The current server architecture is also not E2EE because the server handles plaintext during upload/decryption.
+The current CP-ABE implementation is an adapted research implementation and has not received an independent cryptographic audit. The current server architecture is also not E2EE because the server handles plaintext during upload/decryption. During multipart upload, plaintext is temporarily staged in Veyra's private 0700 temp directory because the current authenticated object format requires the final plaintext size before encryption. The staging file is mode 0600, randomly named, never logged, removed on request cleanup, purged at startup after crashes, and swept when stale. This is not a claim of forensic erasure from flash/storage media.
 
 Production deployments should add:
 

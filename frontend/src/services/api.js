@@ -49,7 +49,6 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body ?? {}),
     }),
-  delete: (path) => request(path, { method: "DELETE" }),
 
   upload: async (path, formData, onProgress) => {
     const xhr = new XMLHttpRequest();
@@ -90,20 +89,3 @@ export const api = {
     });
   },
 };
-
-export async function downloadBlob(path) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: "include",
-  });
-
-  if (!response.ok) {
-    let message = "Download failed.";
-    try {
-      const body = await response.json();
-      message = body.message || message;
-    } catch {}
-    throw new Error(message);
-  }
-
-  return response.blob();
-}

@@ -5,7 +5,7 @@ Production-oriented installer for Ubuntu 24.04.
 ## Test installation
 
 ```bash
-sudo ./installer/install.sh --dev-mode
+sudo ./installer/install.sh --dev-mode   # codes are printed to the service log (journalctl -u veyra-api); never for production
 ```
 
 Development mode uses the development OTP mailbox and does not require SMTP.
@@ -36,13 +36,17 @@ sudo VEYRA_APT_WAIT_TIMEOUT=1800 ./installer/install.sh --dev-mode
 
 If the package manager remains busy beyond the timeout, the installer exits safely and can be rerun later.
 
-## Public port
+## Public and API ports
 
-The installer checks the requested port and otherwise selects an available public port.
+A fresh installation scans TCP and UDP listeners on IPv4 and IPv6, then selects two different random non-privileged ports for Nginx/public traffic and the localhost API. Ports 80 and 443 are never selected randomly.
+
+An explicit public port may be supplied: 
 
 ```bash
 sudo ./installer/install.sh --dev-mode --port 8080
 ```
+
+`veyractl update` preserves the existing public and API ports, TLS certificate/key configuration, and public URL instead of selecting new ports.
 
 ## Management
 
